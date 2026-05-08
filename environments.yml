@@ -1,0 +1,15 @@
+name: ilp-decoder
+channels:
+	- conda-forge
+	- defaults
+dependencies:
+	- python>=3.10
+	- numpy
+	- scipy
+	- pytest
+	- stim
+	- pymatching
+  - beliefmatching
+	- pip
+	- pip:
+			- gurobipy

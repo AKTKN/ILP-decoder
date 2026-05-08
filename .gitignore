@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+
+# Generated data artifacts
+# *.b8
+# *.dem
+# *.stim
+
+# Local tooling
+.vscode/
+
+# Development-only dependencies
+BeliefMatching/
