@@ -275,6 +275,7 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
         get_logicalgap: bool = False,
+        logical_gap_flip_last_detector: bool = False,
     ) -> DecodeResult:
         """Decode a single syndrome sample and return a full DecodeResult.
 
@@ -319,6 +320,7 @@ class ILPDecoder:
                 weight_vector=weight_vector,
                 extra_constraints=extra_constraints,
                 config=active_config,
+                flip_last_detector=logical_gap_flip_last_detector,
             )
             metadata["logical_gap"] = logical_gap
 
@@ -370,6 +372,7 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
         get_logicalgap: bool = False,
+        logical_gap_flip_last_detector: bool = False,
     ) -> Sequence[DecodeResult]:
         """Decode a batch of syndromes and return DecodeResult objects."""
 
@@ -409,6 +412,7 @@ class ILPDecoder:
                     weight_vector=weight_vector,
                     extra_constraints=extra_constraints,
                     config=active_config,
+                    flip_last_detector=logical_gap_flip_last_detector,
                 )
                 metadata["logical_gap"] = logical_gap
             results.append(
@@ -434,14 +438,15 @@ class ILPDecoder:
         weight_vector: Optional[Weights],
         extra_constraints: Optional[Mapping[str, Any]],
         config: DecoderConfig,
+        flip_last_detector: bool,
     ) -> Optional[float]:
         """Compute logical gap via a second-stage ILP solve."""
 
         if stage1_objective is None:
-            return None
+            raise AssertionError("Logical gap requested but stage-1 objective is None.")
         logical_class = np.asarray(logical_class, dtype=int).ravel() % 2
         if logical_class.size == 0:
-            return None
+            raise AssertionError("Logical gap requested but no logical observables are available.")
 
         gap_model_result = build_logical_gap_model(
             self._deps.env,
@@ -453,11 +458,17 @@ class ILPDecoder:
             weight_vector=weight_vector,
             extra_constraints=extra_constraints,
         )
+        gap_syndrome = np.asarray(syndrome, dtype=int)
+        if flip_last_detector:
+            if gap_syndrome.size == 0:
+                raise AssertionError("Logical gap flip requested but syndrome is empty.")
+            gap_syndrome = gap_syndrome.copy()
+            gap_syndrome[-1] = int(gap_syndrome[-1] ^ 1)
         gap_result = self._solver_backend.solve(
             gap_model_result,
-            syndrome,
+            gap_syndrome,
             config=config,
         )
         if not gap_result.success or gap_result.objective_value is None:
-            return None
+            raise AssertionError("Logical gap solve failed or objective unavailable.")
         return float(gap_result.objective_value - stage1_objective)

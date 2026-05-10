@@ -244,7 +244,7 @@ def build_logical_gap_model(
 		for col in cols:
 			expr.add(error_vars[col])
 		model.addConstr(
-			expr - 2 * u_vars[row] == z_vars[row] + int(logical_class[row]),
+			expr + int(logical_class[row]) - 2 * u_vars[row] == z_vars[row] ,
 			name=f"logical_{row}",
 		)
 
