@@ -183,3 +183,92 @@ def build_base_model(
 		syndrome_constraints=syndrome_constraints,
 		objective=objective,
 	)
+
+
+def build_logical_gap_model(
+	env: Env,
+	parity_check_matrix: ParityCheckMatrix,
+	observables: Observables,
+	config: DecoderConfig,
+	*,
+	logical_class: Sequence[int],
+	prior: Optional[Prior] = None,
+	weight_vector: Optional[Weights] = None,
+	extra_constraints: Optional[Mapping[str, Any]] = None,
+) -> BuildModelResult:
+	"""Create a stage-2 model that excludes a target logical class."""
+
+	import gurobipy as gp
+
+	# Preserve sparse matrices to avoid dense materialization.
+	num_checks, num_errors = parity_check_matrix.shape
+	if observables.shape[1] != num_errors:
+		raise ValueError("Observables must have the same column size as the check matrix.")
+
+	if weight_vector is None:
+		if prior is not None:
+			weight_vector = _compute_weights_from_prior(np.asarray(prior, dtype=float))
+		else:
+			weight_vector = np.ones(num_errors, dtype=float)
+	else:
+		weight_vector = np.asarray(weight_vector, dtype=float)
+
+	if weight_vector.shape[0] != num_errors:
+		raise ValueError("Weight vector length must match number of error variables.")
+
+	logical_class = np.asarray(logical_class, dtype=int).ravel() % 2
+	num_logicals = observables.shape[0]
+	if logical_class.shape[0] != num_logicals:
+		raise ValueError("Logical class length must match number of observables.")
+
+	model = gp.Model(env=env)
+	_apply_config_params(model, config)
+
+	error_vars = model.addVars(num_errors, vtype=gp.GRB.BINARY, name="e")
+	parity_slack = model.addVars(num_checks, vtype=gp.GRB.INTEGER, lb=0, name="t")
+
+	syndrome_constraints = []
+	row_indices = _iter_row_indices(parity_check_matrix)
+	for row, cols in enumerate(row_indices):
+		expr = gp.LinExpr()
+		for col in cols:
+			expr.add(error_vars[col])
+		constr = model.addConstr(expr - 2 * parity_slack[row] == 0, name=f"syn_{row}")
+		syndrome_constraints.append(constr)
+
+	z_vars = model.addVars(num_logicals, vtype=gp.GRB.BINARY, name="z")
+	u_vars = model.addVars(num_logicals, vtype=gp.GRB.INTEGER, lb=0, name="u")
+	logical_row_indices = _iter_row_indices(observables)
+	for row, cols in enumerate(logical_row_indices):
+		expr = gp.LinExpr()
+		for col in cols:
+			expr.add(error_vars[col])
+		model.addConstr(
+			expr - 2 * u_vars[row] == z_vars[row] + int(logical_class[row]),
+			name=f"logical_{row}",
+		)
+
+	if num_logicals > 0:
+		model.addConstr(gp.quicksum(z_vars[i] for i in range(num_logicals)) >= 1, name="logical_diff")
+
+	objective = gp.quicksum(weight_vector[j] * error_vars[j] for j in range(num_errors))
+	model.setObjective(objective, gp.GRB.MINIMIZE)
+
+	if extra_constraints:
+		custom_builder = extra_constraints.get("builder")
+		if callable(custom_builder):
+			custom_builder(model, error_vars, parity_slack)
+
+	model.update()
+
+	return BuildModelResult(
+		model=model,
+		error_vars=[error_vars[j] for j in range(num_errors)],
+		auxiliary_vars={
+			"parity_slack": [parity_slack[i] for i in range(num_checks)],
+			"logical_xor": [z_vars[i] for i in range(num_logicals)],
+			"logical_slack": [u_vars[i] for i in range(num_logicals)],
+		},
+		syndrome_constraints=syndrome_constraints,
+		objective=objective,
+	)

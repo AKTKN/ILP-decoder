@@ -190,6 +190,43 @@ def test_ilp_decoder_surface_code_against_mwpm(gurobi_env):
     assert np.array_equal(ilp_logical_errors, mwpm_logical_errors)
 
 
+def test_gap_collection(gurobi_env):
+
+    dem_path = os.path.join(
+        test_dir, "surface_code_rotated_memory_x_d_7_p_0.007_50_shots.b8"
+    )
+    if not os.path.exists(dem_path):
+        generate_shot_data()
+
+    circuit = stim.Circuit.from_file(
+        os.path.join(test_dir, "surface_code_rotated_memory_x_d_7_p_0.007.stim")
+    )
+    dem = circuit.detector_error_model(decompose_errors=True)
+    mats = detector_error_model_to_check_matrices(dem)
+    edge_priors = _edge_priors_from_hyperedges(mats)
+
+    decoder = _build_ilp_decoder(
+        gurobi_env, mats.edge_check_matrix, mats.edge_observables_matrix, edge_priors
+    )
+
+    shot_data = stim.read_shot_data_file(
+        path=dem_path,
+        format="b8",
+        num_detectors=dem.num_detectors,
+        num_observables=dem.num_observables,
+    )
+    shots = shot_data[:, 0 : dem.num_detectors]
+    shots = shots[:5]
+
+    results = decoder.decode_batch_result(shots, get_logicalgap=True)
+    gaps = [result.metadata.get("logical_gap") for result in results]
+
+    assert len(gaps) == shots.shape[0]
+    assert all(gap is not None for gap in gaps)
+    assert np.all(np.isfinite(np.asarray(gaps, dtype=float)))
+    assert np.all(np.asarray(gaps, dtype=float) >= 0.0)
+
+
 # Notes on MWPM vs ILP alignment:
 # - The ILP decoder in this file supports hyperedge variables (from DEM) or edge variables.
 # - MWPM operates on edges, so to make objective values comparable we construct MWPM from

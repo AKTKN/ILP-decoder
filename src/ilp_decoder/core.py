@@ -10,7 +10,14 @@ from typing import Any, Mapping, Optional, Protocol, Sequence, TYPE_CHECKING
 
 import numpy as np
 
-from .formulation import BuildModelResult, Observables, ParityCheckMatrix, Weights, build_base_model
+from .formulation import (
+    BuildModelResult,
+    Observables,
+    ParityCheckMatrix,
+    Weights,
+    build_base_model,
+    build_logical_gap_model,
+)
 from .models import DecodeResult, DecoderConfig, Prior, Syndrome
 
 if TYPE_CHECKING:
@@ -267,10 +274,12 @@ class ILPDecoder:
         weight_vector: Optional[Weights] = None,
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
+        get_logicalgap: bool = False,
     ) -> DecodeResult:
         """Decode a single syndrome sample and return a full DecodeResult.
 
         This is useful for debugging and metric computation.
+        Set get_logicalgap=True to compute the logical gap and store it in metadata.
         """
 
         active_config = config or self._config
@@ -301,6 +310,18 @@ class ILPDecoder:
             self._observables, backend_result.error_vector
         )
 
+        metadata = dict(backend_result.metadata)
+        if get_logicalgap:
+            logical_gap = self._compute_logical_gap(
+                syndrome,
+                predicted_observables,
+                backend_result.objective_value,
+                weight_vector=weight_vector,
+                extra_constraints=extra_constraints,
+                config=active_config,
+            )
+            metadata["logical_gap"] = logical_gap
+
         return DecodeResult(
             success=backend_result.success,
             error_vector=backend_result.error_vector,
@@ -308,7 +329,7 @@ class ILPDecoder:
             runtime_ms=backend_result.runtime_ms,
             status=backend_result.status,
             predicted_observables=predicted_observables,
-            metadata=backend_result.metadata,
+            metadata=metadata,
         )
 
     def decode_batch(
@@ -348,6 +369,7 @@ class ILPDecoder:
         weight_vector: Optional[Weights] = None,
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
+        get_logicalgap: bool = False,
     ) -> Sequence[DecodeResult]:
         """Decode a batch of syndromes and return DecodeResult objects."""
 
@@ -378,6 +400,17 @@ class ILPDecoder:
             predicted_observables = _compute_observable_predictions(
                 self._observables, backend_result.error_vector
             )
+            metadata = dict(backend_result.metadata)
+            if get_logicalgap:
+                logical_gap = self._compute_logical_gap(
+                    syndrome,
+                    predicted_observables,
+                    backend_result.objective_value,
+                    weight_vector=weight_vector,
+                    extra_constraints=extra_constraints,
+                    config=active_config,
+                )
+                metadata["logical_gap"] = logical_gap
             results.append(
                 DecodeResult(
                     success=backend_result.success,
@@ -386,8 +419,45 @@ class ILPDecoder:
                     runtime_ms=backend_result.runtime_ms,
                     status=backend_result.status,
                     predicted_observables=predicted_observables,
-                    metadata=backend_result.metadata,
+                    metadata=metadata,
                 )
             )
 
         return results
+
+    def _compute_logical_gap(
+        self,
+        syndrome: Syndrome,
+        logical_class: np.ndarray,
+        stage1_objective: Optional[float],
+        *,
+        weight_vector: Optional[Weights],
+        extra_constraints: Optional[Mapping[str, Any]],
+        config: DecoderConfig,
+    ) -> Optional[float]:
+        """Compute logical gap via a second-stage ILP solve."""
+
+        if stage1_objective is None:
+            return None
+        logical_class = np.asarray(logical_class, dtype=int).ravel() % 2
+        if logical_class.size == 0:
+            return None
+
+        gap_model_result = build_logical_gap_model(
+            self._deps.env,
+            self._parity_check_matrix,
+            self._observables,
+            config,
+            logical_class=logical_class,
+            prior=self._prior,
+            weight_vector=weight_vector,
+            extra_constraints=extra_constraints,
+        )
+        gap_result = self._solver_backend.solve(
+            gap_model_result,
+            syndrome,
+            config=config,
+        )
+        if not gap_result.success or gap_result.objective_value is None:
+            return None
+        return float(gap_result.objective_value - stage1_objective)
