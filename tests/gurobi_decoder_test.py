@@ -16,6 +16,11 @@ if SRC_DIR not in sys.path:
 from beliefmatching import detector_error_model_to_check_matrices
 from ilp_decoder import DecoderConfig, ILPDecoder
 from ilp_decoder.utils import is_logical_error
+from ilp_decoder.gap_mwpm import (
+    build_gap_dem,
+    compute_mwpm_logical_gap,
+    write_gap_shot_data_file,
+)
 from ilp_decoder.core import DecoderDependencies
 
 test_dir = os.path.dirname(os.path.realpath(__file__))
@@ -188,6 +193,67 @@ def test_ilp_decoder_surface_code_against_mwpm(gurobi_env):
         observables, mats.edge_observables_matrix, mwpm_predicted
     )
     assert np.array_equal(ilp_logical_errors, mwpm_logical_errors)
+
+
+def test_gap_collection(gurobi_env):
+
+    dem_path = os.path.join(
+        test_dir, "surface_code_rotated_memory_x_d_7_p_0.007_50_shots_gapsim.b8"
+    )
+
+    circuit = stim.Circuit.from_file(
+        os.path.join(test_dir, "surface_code_rotated_memory_x_d_7_p_0.007.stim")
+    )
+
+    if not os.path.exists(dem_path):
+        write_gap_shot_data_file(circuit, 50, dem_path)
+
+    dem = build_gap_dem(circuit)
+    mats = detector_error_model_to_check_matrices(dem)
+    edge_priors = _edge_priors_from_hyperedges(mats)
+
+    decoder = _build_ilp_decoder(
+        gurobi_env, mats.edge_check_matrix, mats.edge_observables_matrix, edge_priors
+    )
+
+    shot_data = stim.read_shot_data_file(
+        path=dem_path,
+        format="b8",
+        num_detectors=dem.num_detectors,
+        num_observables=dem.num_observables,
+    )
+    shots = shot_data[:, 0 : dem.num_detectors]
+    shots = shots[:20]
+
+    ilp_results = decoder.decode_batch_result(
+        shots,
+        get_logicalgap=True,
+        logical_gap_flip_last_detector=True,
+    )
+    ilp_gap_values = [result.metadata.get("logical_gap") for result in ilp_results]
+
+    assert all(gap is not None for gap in ilp_gap_values)
+    ilp_gaps = np.array([float(gap) for gap in ilp_gap_values], dtype=float)
+
+    mwpm_gaps = compute_mwpm_logical_gap(circuit, shots)
+
+    print("ILP gaps:", ilp_gaps)
+    print("MWPM gaps:", mwpm_gaps)
+
+    assert ilp_gaps.shape == mwpm_gaps.shape
+    assert np.allclose(ilp_gaps, mwpm_gaps, rtol=0.0, atol=1e-4)
+
+    matching = _build_mwpm_from_matrices(mats, edge_priors)
+    mwpm_predicted, _ = _decode_batch_with_weights(matching, shots)
+    weights = np.asarray(np.log((1.0 - edge_priors) / edge_priors), dtype=np.float64)
+    ilp_objectives = np.array(
+        [float(weights @ result.error_vector) for result in ilp_results], dtype=float
+    )
+    mwpm_objectives = np.array(
+        [float(weights @ pred) for pred in mwpm_predicted], dtype=float
+    )
+    assert ilp_objectives.shape == mwpm_objectives.shape
+    assert np.allclose(ilp_objectives, mwpm_objectives, rtol=0.0, atol=1e-8)
 
 
 # Notes on MWPM vs ILP alignment:

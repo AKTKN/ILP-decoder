@@ -26,6 +26,6 @@ dist/
 
 # Development-only dependencies
 BeliefMatching/
-
+Donotsync/
 # gurobi tools
 gurobi_install/
