@@ -313,7 +313,7 @@ class ILPDecoder:
 
         metadata = dict(backend_result.metadata)
         if get_logicalgap:
-            logical_gap = self._compute_logical_gap(
+            logical_gap, obs_flip_indices = self._compute_logical_gap(
                 syndrome,
                 predicted_observables,
                 backend_result.objective_value,
@@ -323,6 +323,7 @@ class ILPDecoder:
                 flip_last_detector=logical_gap_flip_last_detector,
             )
             metadata["logical_gap"] = logical_gap
+            metadata["obs_flip_idx"] = obs_flip_indices
 
         return DecodeResult(
             success=backend_result.success,
@@ -405,7 +406,7 @@ class ILPDecoder:
             )
             metadata = dict(backend_result.metadata)
             if get_logicalgap:
-                logical_gap = self._compute_logical_gap(
+                logical_gap, obs_flip_indices = self._compute_logical_gap(
                     syndrome,
                     predicted_observables,
                     backend_result.objective_value,
@@ -415,6 +416,7 @@ class ILPDecoder:
                     flip_last_detector=logical_gap_flip_last_detector,
                 )
                 metadata["logical_gap"] = logical_gap
+                metadata["obs_flip_idx"] = obs_flip_indices
             results.append(
                 DecodeResult(
                     success=backend_result.success,
@@ -439,7 +441,7 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]],
         config: DecoderConfig,
         flip_last_detector: bool,
-    ) -> Optional[float]:
+    ) -> tuple[Optional[float], list[int]]:
         """Compute logical gap via a second-stage ILP solve."""
 
         if stage1_objective is None:
@@ -471,4 +473,8 @@ class ILPDecoder:
         )
         if not gap_result.success or gap_result.objective_value is None:
             raise AssertionError("Logical gap solve failed or objective unavailable.")
-        return float(gap_result.objective_value - stage1_objective)
+        z_vars_list = gap_model_result.auxiliary_vars.get("logical_xor", [])
+        obs_flip_indices = [
+            i for i, v in enumerate(z_vars_list) if int(round(v.X)) == 1
+        ]
+        return float(gap_result.objective_value - stage1_objective), obs_flip_indices

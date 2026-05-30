@@ -183,3 +183,59 @@ def test_bbcode_ilp_decoder_logical_gap_end_to_end(gurobi_env, bbcode_data):
     assert all(gap is not None for gap in ilp_gap_values)
     ilp_gaps = np.array([float(gap) for gap in ilp_gap_values], dtype=float)
     assert ilp_gaps.shape[0] == shots.shape[0]
+
+
+def test_bbcode_obs_flip_idx(gurobi_env, bbcode_data):
+    from ilp_decoder.formulation import build_logical_gap_model
+
+    mats = bbcode_data["mats"]
+    priors = bbcode_data["priors"]
+    shots = bbcode_data["shots"]
+
+    num_observables = mats.observables_matrix.shape[0]
+    assert num_observables >= 4, "Test requires a circuit with at least 4 observables."
+
+    decoder = _build_ilp_decoder(
+        gurobi_env, mats.check_matrix, mats.observables_matrix, priors
+    )
+    ilp_results = decoder.decode_batch_result(
+        shots,
+        get_logicalgap=True,
+        logical_gap_flip_last_detector=False,
+    )
+
+    config = DecoderConfig(log_to_console=False)
+
+    for i, result in enumerate(ilp_results):
+        assert "obs_flip_idx" in result.metadata, f"Shot {i}: obs_flip_idx missing"
+        flip_idx = result.metadata["obs_flip_idx"]
+
+        assert isinstance(flip_idx, list), f"Shot {i}: obs_flip_idx is not a list"
+        assert len(flip_idx) > 0, f"Shot {i}: obs_flip_idx is empty (violates sum(z)>=1)"
+        assert all(
+            0 <= idx < num_observables for idx in flip_idx
+        ), f"Shot {i}: obs_flip_idx contains out-of-range index"
+
+        # Correctness check: re-solve stage-2 independently and compare z_vars.
+        logical_class = np.asarray(result.predicted_observables, dtype=int).ravel() % 2
+        gap_model_result = build_logical_gap_model(
+            gurobi_env,
+            mats.check_matrix,
+            mats.observables_matrix,
+            config,
+            logical_class=logical_class,
+            prior=priors,
+        )
+        gap_model_result.model.setParam("OutputFlag", 0)
+        for j, constr in enumerate(gap_model_result.syndrome_constraints):
+            constr.RHS = int(shots[i][j])
+        gap_model_result.model.optimize()
+
+        assert gap_model_result.model.SolCount > 0, f"Shot {i}: reference solve found no solution"
+        z_vars_list = gap_model_result.auxiliary_vars["logical_xor"]
+        expected = sorted(
+            k for k, v in enumerate(z_vars_list) if int(round(v.X)) == 1
+        )
+        assert sorted(flip_idx) == expected, (
+            f"Shot {i}: obs_flip_idx {sorted(flip_idx)} != reference z_vars {expected}"
+        )
