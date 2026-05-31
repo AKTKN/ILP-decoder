@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ilp-decoder"
-version = "0.1.0"
-description = "ILP decoder for quantum error correction using Gurobi."
+version = "0.1.1"
+description = "ILP decoder for quantum error correction using Gurobi and cplex."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -13,6 +13,8 @@ dependencies = [
 	"numpy",
 	"scipy",
 	"gurobipy",
+	"cplex",
+	"docplex"
 ]
 
 [project.optional-dependencies]

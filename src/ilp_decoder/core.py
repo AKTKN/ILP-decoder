@@ -5,7 +5,8 @@ This module wires together model construction and solver execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Mapping, Optional, Protocol, Sequence, TYPE_CHECKING
 
 import numpy as np
@@ -24,16 +25,49 @@ if TYPE_CHECKING:
     from gurobipy import Env
 
 
+# ---------------------------------------------------------------------------
+# Backend selector
+# ---------------------------------------------------------------------------
+
+class OptimizerBackend(Enum):
+    """Supported optimizer backends."""
+
+    GUROBI = "gurobi"
+    CPLEX = "cplex"
+
+
+# ---------------------------------------------------------------------------
+# Protocols
+# ---------------------------------------------------------------------------
+
 class ModelBuilder(Protocol):
     """Callable interface for constructing solver models."""
 
     def __call__(
         self,
-        env: "Env",
+        env: Any,
         parity_check_matrix: ParityCheckMatrix,
         observables: Observables,
         config: DecoderConfig,
         *,
+        prior: Optional[Prior] = None,
+        weight_vector: Optional[Weights] = None,
+        extra_constraints: Optional[Mapping[str, Any]] = None,
+    ) -> BuildModelResult:
+        ...
+
+
+class GapModelBuilder(Protocol):
+    """Callable interface for constructing logical-gap solver models."""
+
+    def __call__(
+        self,
+        env: Any,
+        parity_check_matrix: ParityCheckMatrix,
+        observables: Observables,
+        config: DecoderConfig,
+        *,
+        logical_class: Sequence[int],
         prior: Optional[Prior] = None,
         weight_vector: Optional[Weights] = None,
         extra_constraints: Optional[Mapping[str, Any]] = None,
@@ -53,6 +87,10 @@ class SolverBackend(Protocol):
     ) -> DecodeResult:
         ...
 
+
+# ---------------------------------------------------------------------------
+# Gurobi helpers (kept in this module to avoid circular imports)
+# ---------------------------------------------------------------------------
 
 def _apply_config_params(model: Any, config: DecoderConfig) -> None:
     """Apply standard solver parameters from DecoderConfig."""
@@ -111,6 +149,10 @@ def _compute_observable_predictions(
     return (obs_dense @ error_vector) % 2
 
 
+# ---------------------------------------------------------------------------
+# Gurobi backend
+# ---------------------------------------------------------------------------
+
 class GurobiBackend:
     """Default solver backend using Gurobi."""
 
@@ -168,20 +210,61 @@ class GurobiBackend:
         )
 
 
+# ---------------------------------------------------------------------------
+# Environment validation
+# ---------------------------------------------------------------------------
+
+def _validate_env_backend(env: Any, backend: OptimizerBackend) -> None:
+    """Raise TypeError if env and backend are inconsistent."""
+
+    from .cplex_backend import CplexEnv
+
+    if backend == OptimizerBackend.CPLEX:
+        if not isinstance(env, CplexEnv):
+            raise TypeError(
+                f"CPLEX backend requires a CplexEnv instance, got {type(env).__name__}. "
+                "Create one with: from ilp_decoder.cplex_backend import CplexEnv; env = CplexEnv()"
+            )
+    elif backend == OptimizerBackend.GUROBI:
+        if isinstance(env, CplexEnv):
+            raise TypeError(
+                "GUROBI backend does not accept a CplexEnv. "
+                "Pass a gurobipy.Env instance instead."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class DecoderDependencies:
     """Injected dependencies for the decoder.
 
     Attributes:
-        env: Gurobi environment instance (configure license/auth externally if required).
-        model_builder: Function that builds the optimization model.
+        env: Solver environment instance.  For Gurobi, pass a gurobipy.Env.
+             For CPLEX, pass a CplexEnv from ilp_decoder.cplex_backend.
+        backend: Which optimizer to use (GUROBI or CPLEX).  The decoder
+                 validates that env matches the selected backend and raises
+                 TypeError if they are inconsistent.
+        model_builder: Function that builds the base optimization model.
+                       Defaults to the appropriate builder for the chosen backend.
+        gap_model_builder: Function that builds the logical-gap model.
+                           Defaults to the appropriate builder for the chosen backend.
         solver_backend: Strategy that solves the model and extracts results.
+                        Defaults to the appropriate backend for the chosen backend.
     """
 
-    env: "Env"
-    model_builder: ModelBuilder = build_base_model
+    env: Any
+    backend: OptimizerBackend = OptimizerBackend.GUROBI
+    model_builder: Optional[ModelBuilder] = None
+    gap_model_builder: Optional[GapModelBuilder] = None
     solver_backend: Optional[SolverBackend] = None
 
+
+# ---------------------------------------------------------------------------
+# High-level decoder
+# ---------------------------------------------------------------------------
 
 class ILPDecoder:
     """High-level decoder interface.
@@ -209,6 +292,9 @@ class ILPDecoder:
             deps: Injected dependencies for model building and solving.
         """
 
+        # Validate that env type matches the declared backend.
+        _validate_env_backend(deps.env, deps.backend)
+
         num_errors = parity_check_matrix.shape[1]
         if observables.shape[1] != num_errors:
             raise ValueError("Observables must have the same column size as the check matrix.")
@@ -222,10 +308,24 @@ class ILPDecoder:
         self._prior = prior
         self._config = config
         self._deps = deps
-        self._solver_backend = deps.solver_backend or GurobiBackend()
+
+        # Select builder and backend defaults based on the declared backend.
+        if deps.backend == OptimizerBackend.CPLEX:
+            from .cplex_formulation import (
+                build_base_model_cplex,
+                build_logical_gap_model_cplex,
+            )
+            from .cplex_backend import CplexBackend
+            self._model_builder: ModelBuilder = deps.model_builder or build_base_model_cplex
+            self._gap_model_builder: GapModelBuilder = deps.gap_model_builder or build_logical_gap_model_cplex
+            self._solver_backend: SolverBackend = deps.solver_backend or CplexBackend()
+        else:
+            self._model_builder = deps.model_builder or build_base_model
+            self._gap_model_builder = deps.gap_model_builder or build_logical_gap_model
+            self._solver_backend = deps.solver_backend or GurobiBackend()
 
         # Build a reusable base model upfront for fast decoding.
-        self._base_model_result = deps.model_builder(
+        self._base_model_result = self._model_builder(
             deps.env,
             parity_check_matrix,
             observables,
@@ -290,7 +390,7 @@ class ILPDecoder:
             model_result = self._base_model_result
         else:
             # Rebuild when overrides are supplied to keep the base model reusable.
-            model_result = self._deps.model_builder(
+            model_result = self._model_builder(
                 self._deps.env,
                 self._parity_check_matrix,
                 self._observables,
@@ -383,7 +483,7 @@ class ILPDecoder:
         if weight_vector is None and extra_constraints is None and config is None:
             model_result = self._base_model_result
         else:
-            model_result = self._deps.model_builder(
+            model_result = self._model_builder(
                 self._deps.env,
                 self._parity_check_matrix,
                 self._observables,
@@ -450,7 +550,7 @@ class ILPDecoder:
         if logical_class.size == 0:
             raise AssertionError("Logical gap requested but no logical observables are available.")
 
-        gap_model_result = build_logical_gap_model(
+        gap_model_result = self._gap_model_builder(
             self._deps.env,
             self._parity_check_matrix,
             self._observables,
