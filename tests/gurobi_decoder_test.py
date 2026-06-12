@@ -256,6 +256,29 @@ def test_gap_collection(gurobi_env):
     assert np.allclose(ilp_objectives, mwpm_objectives, rtol=0.0, atol=1e-8)
 
 
+def test_gurobi_gap_detail_steane(gurobi_env):
+    prior = np.full(7, 0.1, dtype=float)
+    error_vector = np.array([1, 0, 0, 0, 0, 0, 0], dtype=int)
+    syndrome = np.asarray((H_STEANE @ error_vector) % 2, dtype=int).ravel()
+
+    decoder = _build_ilp_decoder(gurobi_env, H_STEANE, LX_STEANE, prior)
+    result = decoder.decode_result(
+        syndrome,
+        get_logical_gap=True,
+        get_gap_detail=True,
+    )
+
+    assert result.success
+    assert "logical_gap" in result.metadata
+    assert "gap_detail" in result.metadata
+
+    gap_detail = result.metadata["gap_detail"]
+    assert gap_detail["stage1_weight"] == pytest.approx(result.objective_value)
+    assert gap_detail["stage2_weight"] >= gap_detail["stage1_weight"]
+    assert isinstance(gap_detail["stage2_error_vector"], np.ndarray)
+    assert gap_detail["stage2_error_vector"].shape == result.error_vector.shape
+
+
 # Notes on MWPM vs ILP alignment:
 # - The ILP decoder in this file supports hyperedge variables (from DEM) or edge variables.
 # - MWPM operates on edges, so to make objective values comparable we construct MWPM from
@@ -265,4 +288,3 @@ def test_gap_collection(gurobi_env):
 #   (e.g., -log(p) vs log-odds).
 # - If you instead build MWPM directly from the DEM (or use hyperedge variables for ILP),
 #   the objective values need not match even when the logical error rates are similar.
-

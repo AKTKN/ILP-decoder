@@ -217,7 +217,11 @@ def test_cplex_ilp_decoder_steane_logical_gap(cplex_env):
     syndrome = np.asarray((H_STEANE @ error_vector) % 2, dtype=int).ravel()
 
     decoder = _build_ilp_decoder(cplex_env, H_STEANE, LX_STEANE, prior)
-    result = decoder.decode_result(syndrome, get_logicalgap=True)
+    result = decoder.decode_result(
+        syndrome,
+        get_logicalgap=True,
+        get_gap_detail=True,
+    )
 
     assert result.success
     assert "logical_gap" in result.metadata
@@ -230,6 +234,12 @@ def test_cplex_ilp_decoder_steane_logical_gap(cplex_env):
     flip_idx = result.metadata["obs_flip_idx"]
     assert isinstance(flip_idx, list)
     assert len(flip_idx) > 0
+
+    gap_detail = result.metadata["gap_detail"]
+    assert gap_detail["stage1_weight"] == pytest.approx(result.objective_value)
+    assert gap_detail["stage2_weight"] >= gap_detail["stage1_weight"]
+    assert isinstance(gap_detail["stage2_error_vector"], np.ndarray)
+    assert gap_detail["stage2_error_vector"].shape == result.error_vector.shape
 
 
 def test_cplex_solver_metadata(cplex_env):

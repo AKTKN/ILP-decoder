@@ -5,6 +5,7 @@ This module wires together model construction and solver execution.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Optional, Protocol, Sequence, TYPE_CHECKING
@@ -147,6 +148,32 @@ def _compute_observable_predictions(
 
     obs_dense = np.asarray(observables, dtype=int)
     return (obs_dense @ error_vector) % 2
+
+
+def _release_solver_model(model: Any) -> None:
+    """Release native solver resources held by a model, if supported."""
+
+    for method_name in ("end", "dispose", "close"):
+        method = getattr(model, method_name, None)
+        if callable(method):
+            method()
+            return
+
+
+def _resolve_logical_gap_flag(
+    legacy_flag: bool,
+    explicit_flag: Optional[bool],
+) -> bool:
+    """Resolve `get_logicalgap` and `get_logical_gap` into one boolean."""
+
+    if explicit_flag is None:
+        return legacy_flag
+    if legacy_flag and not explicit_flag:
+        raise ValueError(
+            "Received conflicting logical-gap flags: "
+            "get_logicalgap=True and get_logical_gap=False."
+        )
+    return explicit_flag
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +335,7 @@ class ILPDecoder:
         self._prior = prior
         self._config = config
         self._deps = deps
+        self._closed = False
 
         # Select builder and backend defaults based on the declared backend.
         if deps.backend == OptimizerBackend.CPLEX:
@@ -332,6 +360,28 @@ class ILPDecoder:
             config,
             prior=prior,
         )
+
+    def close(self) -> None:
+        """Release native resources held by the cached base model."""
+
+        if self._closed:
+            return
+        self._closed = True
+        _release_solver_model(self._base_model_result.model)
+
+    def __enter__(self) -> "ILPDecoder":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("ILPDecoder has been closed.")
 
     @property
     def config(self) -> DecoderConfig:
@@ -375,6 +425,8 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
         get_logicalgap: bool = False,
+        get_logical_gap: Optional[bool] = None,
+        get_gap_detail: bool = False,
         logical_gap_flip_last_detector: bool = False,
     ) -> DecodeResult:
         """Decode a single syndrome sample and return a full DecodeResult.
@@ -383,11 +435,17 @@ class ILPDecoder:
         Set get_logicalgap=True to compute the logical gap and store it in metadata.
         """
 
+        self._ensure_open()
+        get_logicalgap = _resolve_logical_gap_flag(get_logicalgap, get_logical_gap)
+        if get_gap_detail and not get_logicalgap:
+            raise ValueError("get_gap_detail requires get_logicalgap=True.")
+
         active_config = config or self._config
 
         # Reuse the cached model unless the caller supplies overrides.
         if weight_vector is None and extra_constraints is None and config is None:
             model_result = self._base_model_result
+            owns_model_result = False
         else:
             # Rebuild when overrides are supplied to keep the base model reusable.
             model_result = self._model_builder(
@@ -399,41 +457,51 @@ class ILPDecoder:
                 weight_vector=weight_vector,
                 extra_constraints=extra_constraints,
             )
+            owns_model_result = True
 
-        # Solve the ILP and map the solution into observable predictions.
-        backend_result = self._solver_backend.solve(
-            model_result,
-            syndrome,
-            config=active_config,
-        )
-
-        predicted_observables = _compute_observable_predictions(
-            self._observables, backend_result.error_vector
-        )
-
-        metadata = dict(backend_result.metadata)
-        if get_logicalgap:
-            logical_gap, obs_flip_indices = self._compute_logical_gap(
+        try:
+            # Solve the ILP and map the solution into observable predictions.
+            backend_result = self._solver_backend.solve(
+                model_result,
                 syndrome,
-                predicted_observables,
-                backend_result.objective_value,
-                weight_vector=weight_vector,
-                extra_constraints=extra_constraints,
                 config=active_config,
-                flip_last_detector=logical_gap_flip_last_detector,
             )
-            metadata["logical_gap"] = logical_gap
-            metadata["obs_flip_idx"] = obs_flip_indices
+            predicted_observables = _compute_observable_predictions(
+                self._observables, backend_result.error_vector
+            )
 
-        return DecodeResult(
-            success=backend_result.success,
-            error_vector=backend_result.error_vector,
-            objective_value=backend_result.objective_value,
-            runtime_ms=backend_result.runtime_ms,
-            status=backend_result.status,
-            predicted_observables=predicted_observables,
-            metadata=metadata,
-        )
+            metadata = dict(backend_result.metadata)
+            if get_logicalgap:
+                gap_metadata = self._compute_logical_gap(
+                    syndrome,
+                    predicted_observables,
+                    backend_result.objective_value,
+                    weight_vector=weight_vector,
+                    extra_constraints=extra_constraints,
+                    config=active_config,
+                    flip_last_detector=logical_gap_flip_last_detector,
+                )
+                metadata["logical_gap"] = gap_metadata["logical_gap"]
+                metadata["obs_flip_idx"] = gap_metadata["obs_flip_idx"]
+                if get_gap_detail:
+                    metadata["gap_detail"] = {
+                        "stage1_weight": float(backend_result.objective_value),
+                        "stage2_weight": gap_metadata["stage2_weight"],
+                        "stage2_error_vector": gap_metadata["stage2_error_vector"],
+                    }
+
+            return DecodeResult(
+                success=backend_result.success,
+                error_vector=backend_result.error_vector,
+                objective_value=backend_result.objective_value,
+                runtime_ms=backend_result.runtime_ms,
+                status=backend_result.status,
+                predicted_observables=predicted_observables,
+                metadata=metadata,
+            )
+        finally:
+            if owns_model_result:
+                _release_solver_model(model_result.model)
 
     def decode_batch(
         self,
@@ -473,15 +541,23 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]] = None,
         config: Optional[DecoderConfig] = None,
         get_logicalgap: bool = False,
+        get_logical_gap: Optional[bool] = None,
+        get_gap_detail: bool = False,
         logical_gap_flip_last_detector: bool = False,
     ) -> Sequence[DecodeResult]:
         """Decode a batch of syndromes and return DecodeResult objects."""
+
+        self._ensure_open()
+        get_logicalgap = _resolve_logical_gap_flag(get_logicalgap, get_logical_gap)
+        if get_gap_detail and not get_logicalgap:
+            raise ValueError("get_gap_detail requires get_logicalgap=True.")
 
         active_config = config or self._config
 
         # Reuse the cached model unless the caller supplies overrides.
         if weight_vector is None and extra_constraints is None and config is None:
             model_result = self._base_model_result
+            owns_model_result = False
         else:
             model_result = self._model_builder(
                 self._deps.env,
@@ -492,44 +568,54 @@ class ILPDecoder:
                 weight_vector=weight_vector,
                 extra_constraints=extra_constraints,
             )
+            owns_model_result = True
 
-        results = []
-        for syndrome in syndromes:
-            # Solve each shot independently; the backend updates RHS each time.
-            backend_result = self._solver_backend.solve(
-                model_result,
-                syndrome,
-                config=active_config,
-            )
-            predicted_observables = _compute_observable_predictions(
-                self._observables, backend_result.error_vector
-            )
-            metadata = dict(backend_result.metadata)
-            if get_logicalgap:
-                logical_gap, obs_flip_indices = self._compute_logical_gap(
+        try:
+            results = []
+            for syndrome in syndromes:
+                # Solve each shot independently; the backend updates RHS each time.
+                backend_result = self._solver_backend.solve(
+                    model_result,
                     syndrome,
-                    predicted_observables,
-                    backend_result.objective_value,
-                    weight_vector=weight_vector,
-                    extra_constraints=extra_constraints,
                     config=active_config,
-                    flip_last_detector=logical_gap_flip_last_detector,
                 )
-                metadata["logical_gap"] = logical_gap
-                metadata["obs_flip_idx"] = obs_flip_indices
-            results.append(
-                DecodeResult(
-                    success=backend_result.success,
-                    error_vector=backend_result.error_vector,
-                    objective_value=backend_result.objective_value,
-                    runtime_ms=backend_result.runtime_ms,
-                    status=backend_result.status,
-                    predicted_observables=predicted_observables,
-                    metadata=metadata,
+                predicted_observables = _compute_observable_predictions(
+                    self._observables, backend_result.error_vector
                 )
-            )
-
-        return results
+                metadata = dict(backend_result.metadata)
+                if get_logicalgap:
+                    gap_metadata = self._compute_logical_gap(
+                        syndrome,
+                        predicted_observables,
+                        backend_result.objective_value,
+                        weight_vector=weight_vector,
+                        extra_constraints=extra_constraints,
+                        config=active_config,
+                        flip_last_detector=logical_gap_flip_last_detector,
+                    )
+                    metadata["logical_gap"] = gap_metadata["logical_gap"]
+                    metadata["obs_flip_idx"] = gap_metadata["obs_flip_idx"]
+                    if get_gap_detail:
+                        metadata["gap_detail"] = {
+                            "stage1_weight": float(backend_result.objective_value),
+                            "stage2_weight": gap_metadata["stage2_weight"],
+                            "stage2_error_vector": gap_metadata["stage2_error_vector"],
+                        }
+                results.append(
+                    DecodeResult(
+                        success=backend_result.success,
+                        error_vector=backend_result.error_vector,
+                        objective_value=backend_result.objective_value,
+                        runtime_ms=backend_result.runtime_ms,
+                        status=backend_result.status,
+                        predicted_observables=predicted_observables,
+                        metadata=metadata,
+                    )
+                )
+            return results
+        finally:
+            if owns_model_result:
+                _release_solver_model(model_result.model)
 
     def _compute_logical_gap(
         self,
@@ -541,7 +627,7 @@ class ILPDecoder:
         extra_constraints: Optional[Mapping[str, Any]],
         config: DecoderConfig,
         flip_last_detector: bool,
-    ) -> tuple[Optional[float], list[int]]:
+    ) -> Mapping[str, Any]:
         """Compute logical gap via a second-stage ILP solve."""
 
         if stage1_objective is None:
@@ -560,21 +646,29 @@ class ILPDecoder:
             weight_vector=weight_vector,
             extra_constraints=extra_constraints,
         )
-        gap_syndrome = np.asarray(syndrome, dtype=int)
-        if flip_last_detector:
-            if gap_syndrome.size == 0:
-                raise AssertionError("Logical gap flip requested but syndrome is empty.")
-            gap_syndrome = gap_syndrome.copy()
-            gap_syndrome[-1] = int(gap_syndrome[-1] ^ 1)
-        gap_result = self._solver_backend.solve(
-            gap_model_result,
-            gap_syndrome,
-            config=config,
-        )
-        if not gap_result.success or gap_result.objective_value is None:
-            raise AssertionError("Logical gap solve failed or objective unavailable.")
-        z_vars_list = gap_model_result.auxiliary_vars.get("logical_xor", [])
-        obs_flip_indices = [
-            i for i, v in enumerate(z_vars_list) if int(round(v.X)) == 1
-        ]
-        return float(gap_result.objective_value - stage1_objective), obs_flip_indices
+        try:
+            gap_syndrome = np.asarray(syndrome, dtype=int)
+            if flip_last_detector:
+                if gap_syndrome.size == 0:
+                    raise AssertionError("Logical gap flip requested but syndrome is empty.")
+                gap_syndrome = gap_syndrome.copy()
+                gap_syndrome[-1] = int(gap_syndrome[-1] ^ 1)
+            gap_result = self._solver_backend.solve(
+                gap_model_result,
+                gap_syndrome,
+                config=config,
+            )
+            if not gap_result.success or gap_result.objective_value is None:
+                raise AssertionError("Logical gap solve failed or objective unavailable.")
+            z_vars_list = gap_model_result.auxiliary_vars.get("logical_xor", [])
+            obs_flip_indices = [
+                i for i, v in enumerate(z_vars_list) if int(round(v.X)) == 1
+            ]
+            return {
+                "logical_gap": float(gap_result.objective_value - stage1_objective),
+                "obs_flip_idx": obs_flip_indices,
+                "stage2_weight": float(gap_result.objective_value),
+                "stage2_error_vector": gap_result.error_vector.copy(),
+            }
+        finally:
+            _release_solver_model(gap_model_result.model)
